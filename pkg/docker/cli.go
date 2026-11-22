@@ -173,12 +173,23 @@ func (c *Client) RemoveContainers(ctx context.Context, ids []string) error {
 	return err
 }
 
-func (c *Client) RemoveImages(ctx context.Context, ids []string) error {
-	if len(ids) == 0 {
-		return nil
+// RemoveImages deletes images one ref at a time: a repo:tag removes just that
+// tag, an id removes the image when it is the last ref. Removal falls back to
+// `rmi -f` so a dangling parent whose layers are retained by a child image
+// untags instead of aborting the whole clean.
+func (c *Client) RemoveImages(ctx context.Context, refs []string) error {
+	var errs []string
+	for _, ref := range refs {
+		if _, err := c.run(ctx, "rmi", ref); err != nil {
+			if _, ferr := c.run(ctx, "rmi", "-f", ref); ferr != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", ref, ferr))
+			}
+		}
 	}
-	_, err := c.run(ctx, append([]string{"rmi"}, ids...)...)
-	return err
+	if len(errs) > 0 {
+		return fmt.Errorf("rmi failures: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 func (c *Client) RemoveVolumes(ctx context.Context, names []string) error {

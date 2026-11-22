@@ -19,6 +19,9 @@ func NewCliEngine() *CliEngine {
 }
 
 // Run collects candidates, then either reports them (dry-run) or deletes them.
+// A real run collects images and volumes a second time after container removal:
+// the last container of an image or the last user of a volume is itself a
+// candidate, so resources it released must be picked up in the same pass.
 func (e *CliEngine) Run(ctx context.Context, opts types.NukeOptions) (*types.NukeReport, error) {
 	report := &types.NukeReport{Detail: &types.NukeDetail{}}
 
@@ -26,19 +29,7 @@ func (e *CliEngine) Run(ctx context.Context, opts types.NukeOptions) (*types.Nuk
 	if err != nil {
 		return nil, fmt.Errorf("list containers: %w", err)
 	}
-	images, err := e.Client.Images(ctx, opts.All)
-	if err != nil {
-		return nil, fmt.Errorf("list images: %w", err)
-	}
-	var volumes []docker.Volume
-	if opts.IncludeVols || opts.All {
-		volumes, err = e.Client.DanglingVolumes(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("list volumes: %w", err)
-		}
-	}
-
-	var containerIDs, imageIDs, volumeNames []string
+	var containerIDs []string
 	for _, c := range containers {
 		if ShouldKeep(c.Created, opts.KeepDays) || excluded(c.Name, opts.Excludes) {
 			continue
@@ -46,25 +37,55 @@ func (e *CliEngine) Run(ctx context.Context, opts types.NukeOptions) (*types.Nuk
 		containerIDs = append(containerIDs, c.ID)
 		report.Detail.Containers = append(report.Detail.Containers, fmt.Sprintf("%s (%s)", c.Name, shortID(c.ID)))
 	}
-	for _, img := range images {
-		if ShouldKeep(img.Created, opts.KeepDays) || excluded(img.RepoTag, opts.Excludes) {
-			continue
+	report.ContainersRemoved = len(containerIDs)
+
+	seen := map[string]bool{} // refs already queued across collection passes
+	collect := func() ([]string, []string, error) {
+		images, err := e.Client.Images(ctx, opts.All)
+		if err != nil {
+			return nil, nil, fmt.Errorf("list images: %w", err)
 		}
-		imageIDs = append(imageIDs, img.ID)
-		report.Detail.Images = append(report.Detail.Images, fmt.Sprintf("%s (%s)", img.RepoTag, img.ID))
-		report.ImagesSize += img.Size
-	}
-	for _, v := range volumes {
-		if excluded(v.Name, opts.Excludes) {
-			continue
+		var volumes []docker.Volume
+		if opts.IncludeVols || opts.All {
+			volumes, err = e.Client.DanglingVolumes(ctx)
+			if err != nil {
+				return nil, nil, fmt.Errorf("list volumes: %w", err)
+			}
 		}
-		volumeNames = append(volumeNames, v.Name)
-		report.Detail.Volumes = append(report.Detail.Volumes, v.Name)
+		var imageRefs, volumeNames []string
+		for _, img := range images {
+			if ShouldKeep(img.Created, opts.KeepDays) || excluded(img.RepoTag, opts.Excludes) {
+				continue
+			}
+			ref := img.ID
+			if img.RepoTag != "<none>:<none>" {
+				ref = img.RepoTag // untag only; the image lives until its last tag
+			}
+			if seen[ref] {
+				continue
+			}
+			seen[ref] = true
+			imageRefs = append(imageRefs, ref)
+			report.Detail.Images = append(report.Detail.Images, fmt.Sprintf("%s (%s)", img.RepoTag, img.ID))
+			report.ImagesSize += img.Size
+			report.ImagesRemoved++
+		}
+		for _, v := range volumes {
+			if excluded(v.Name, opts.Excludes) || seen[v.Name] {
+				continue
+			}
+			seen[v.Name] = true
+			volumeNames = append(volumeNames, v.Name)
+			report.Detail.Volumes = append(report.Detail.Volumes, v.Name)
+			report.VolumesRemoved++
+		}
+		return imageRefs, volumeNames, nil
 	}
 
-	report.ContainersRemoved = len(containerIDs)
-	report.ImagesRemoved = len(imageIDs)
-	report.VolumesRemoved = len(volumeNames)
+	imageRefs, volumeNames, err := collect()
+	if err != nil {
+		return nil, err
+	}
 
 	if opts.DryRun {
 		return report, nil
@@ -75,7 +96,16 @@ func (e *CliEngine) Run(ctx context.Context, opts types.NukeOptions) (*types.Nuk
 	if err := e.Client.RemoveContainers(ctx, containerIDs); err != nil {
 		return nil, fmt.Errorf("remove containers: %w", err)
 	}
-	if err := e.Client.RemoveImages(ctx, imageIDs); err != nil {
+	// Second pass: removing the containers above may have released their
+	// images and volumes — pick them up before deleting.
+	extraImages, extraVolumes, err := collect()
+	if err != nil {
+		return nil, err
+	}
+	imageRefs = append(imageRefs, extraImages...)
+	volumeNames = append(volumeNames, extraVolumes...)
+
+	if err := e.Client.RemoveImages(ctx, imageRefs); err != nil {
 		return nil, fmt.Errorf("remove images: %w", err)
 	}
 	if err := e.Client.RemoveVolumes(ctx, volumeNames); err != nil {
