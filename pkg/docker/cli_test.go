@@ -43,10 +43,10 @@ func TestImagesFiltersDanglingUnlessAll(t *testing.T) {
 			"bbb000000000|busybox:1.36|4MB|2026-11-01 10:00:00 +0000 UTC\n" +
 			"ccc000000000|old:unused|50MB|2026-11-01 10:00:00 +0000 UTC\n",
 		"ps -aq":  "ctr1\n",
-		"inspect": "sha256:bbb000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", // container uses bbb
+		"inspect": "ctr1|sha256:bbb000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", // ctr1 uses bbb
 	}))
 
-	dangling, err := client.Images(context.Background(), false)
+	dangling, err := client.Images(context.Background(), false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestImagesFiltersDanglingUnlessAll(t *testing.T) {
 		t.Fatalf("expected only dangling aaa, got %+v", dangling)
 	}
 
-	unused, err := client.Images(context.Background(), true)
+	unused, err := client.Images(context.Background(), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

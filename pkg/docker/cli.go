@@ -91,13 +91,15 @@ func (c *Client) StoppedContainers(ctx context.Context) ([]Container, error) {
 	return res, nil
 }
 
-// Images returns dangling images, or every image (unused included) when all is true.
-func (c *Client) Images(ctx context.Context, all bool) ([]Image, error) {
+// Images returns dangling images, or every image (unused included) when all is
+// true. excludeContainers simulates a post-removal world for dry-run previews:
+// an image referenced only by those container ids counts as unused.
+func (c *Client) Images(ctx context.Context, all bool, excludeContainers map[string]bool) ([]Image, error) {
 	out, err := c.run(ctx, "images", "-a", "--format", `{{.ID}}|{{.Repository}}:{{.Tag}}|{{.Size}}|{{.CreatedAt}}`)
 	if err != nil {
 		return nil, err
 	}
-	inUse, err := c.containersUsingImages(ctx)
+	users, err := c.imageUsers(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -114,14 +116,11 @@ func (c *Client) Images(ctx context.Context, all bool) ([]Image, error) {
 			ID:      f[0],
 			RepoTag: f[1],
 			Size:    parseHumanSize(f[2]),
-			InUse:   inUse[f[0]],
+			InUse:   inUseBy(users[f[0]], excludeContainers),
 		}
 		img.Created = parseDockerTime(f[3])
 		dangling := f[1] == "<none>:<none>"
-		if !all && (img.InUse || !dangling) {
-			continue
-		}
-		if all && img.InUse {
+		if (img.InUse || !dangling) && !(all && !img.InUse) {
 			continue
 		}
 		res = append(res, img)
@@ -129,37 +128,105 @@ func (c *Client) Images(ctx context.Context, all bool) ([]Image, error) {
 	return res, nil
 }
 
-func (c *Client) containersUsingImages(ctx context.Context) (map[string]bool, error) {
+func inUseBy(containers []string, excluded map[string]bool) bool {
+	for _, c := range containers {
+		if !excluded[c] {
+			return true
+		}
+	}
+	return false
+}
+
+// imageUsers maps each image's short id to the ids of containers using it.
+func (c *Client) imageUsers(ctx context.Context) (map[string][]string, error) {
 	out, err := c.run(ctx, "ps", "-aq")
 	if err != nil {
 		return nil, err
 	}
-	used := map[string]bool{}
 	list := ids(out)
+	users := map[string][]string{}
 	if len(list) == 0 {
-		return used, nil
+		return users, nil
 	}
-	args := append([]string{"inspect", "-f", `{{.Image}}`}, list...)
+	args := append([]string{"inspect", "-f", `{{.Id}}|{{.Image}}`}, list...)
 	out, err = c.run(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
-	for _, id := range ids(out) {
-		used[strings.TrimPrefix(id, "sha256:")[:min(12, len(strings.TrimPrefix(id, "sha256:")))]] = true
-		used[id] = true
+	for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
+		f := strings.SplitN(l, "|", 2)
+		if len(f) != 2 {
+			continue
+		}
+		ctr, img := f[0], strings.TrimPrefix(f[1], "sha256:")
+		key := img
+		if len(key) > 12 {
+			key = key[:12]
+		}
+		users[key] = append(users[key], ctr)
 	}
-	return used, nil
+	return users, nil
 }
 
-// DanglingVolumes returns volumes not referenced by any container.
-func (c *Client) DanglingVolumes(ctx context.Context) ([]Volume, error) {
+// volumeUsers maps each volume name to the ids of containers mounting it.
+func (c *Client) volumeUsers(ctx context.Context) (map[string][]string, error) {
+	out, err := c.run(ctx, "ps", "-aq")
+	if err != nil {
+		return nil, err
+	}
+	list := ids(out)
+	users := map[string][]string{}
+	if len(list) == 0 {
+		return users, nil
+	}
+	args := append([]string{"inspect", "-f", `{{.Id}}|{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}};{{end}}{{end}}`}, list...)
+	out, err = c.run(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
+		f := strings.SplitN(l, "|", 2)
+		if len(f) != 2 {
+			continue
+		}
+		for _, name := range strings.Split(strings.TrimSuffix(f[1], ";"), ";") {
+			if name != "" {
+				users[name] = append(users[name], f[0])
+			}
+		}
+	}
+	return users, nil
+}
+
+// DanglingVolumes returns volumes not referenced by any container — plus, when
+// excludeContainers is set, volumes referenced only by those container ids
+// (the post-removal world a dry-run previews).
+func (c *Client) DanglingVolumes(ctx context.Context, excludeContainers map[string]bool) ([]Volume, error) {
 	out, err := c.run(ctx, "volume", "ls", "-q", "-f", "dangling=true")
 	if err != nil {
 		return nil, err
 	}
 	var res []Volume
+	seen := map[string]bool{}
 	for _, name := range ids(out) {
+		seen[name] = true
 		res = append(res, Volume{Name: name})
+	}
+	if len(excludeContainers) == 0 {
+		return res, nil
+	}
+	users, err := c.volumeUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for name, containers := range users {
+		if seen[name] {
+			continue
+		}
+		if !inUseBy(containers, excludeContainers) {
+			seen[name] = true
+			res = append(res, Volume{Name: name})
+		}
 	}
 	return res, nil
 }
@@ -173,16 +240,17 @@ func (c *Client) RemoveContainers(ctx context.Context, ids []string) error {
 	return err
 }
 
-// RemoveImages deletes images one ref at a time: a repo:tag removes just that
-// tag, an id removes the image when it is the last ref. Removal falls back to
-// `rmi -f` so a dangling parent whose layers are retained by a child image
-// untags instead of aborting the whole clean.
-func (c *Client) RemoveImages(ctx context.Context, refs []string) error {
+// RemoveImages deletes images by id, one at a time. Deleting by id pins the
+// exact image — a mutable tag cannot redirect the removal to a replacement
+// build, and digest-only rows (repository:<none>) still resolve. Removal falls
+// back to `rmi -f` so a dangling parent whose layers are retained by a child
+// image untags instead of aborting the whole clean.
+func (c *Client) RemoveImages(ctx context.Context, ids []string) error {
 	var errs []string
-	for _, ref := range refs {
-		if _, err := c.run(ctx, "rmi", ref); err != nil {
-			if _, ferr := c.run(ctx, "rmi", "-f", ref); ferr != nil {
-				errs = append(errs, fmt.Sprintf("%s: %v", ref, ferr))
+	for _, id := range ids {
+		if _, err := c.run(ctx, "rmi", id); err != nil {
+			if _, ferr := c.run(ctx, "rmi", "-f", id); ferr != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", id, ferr))
 			}
 		}
 	}
