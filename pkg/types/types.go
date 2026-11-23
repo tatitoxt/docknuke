@@ -15,13 +15,23 @@ type NukeOptions struct {
 	IncludeBuild bool
 }
 
+// NukeDetail lists exactly what was (or would be) removed.
+type NukeDetail struct {
+	Containers []string
+	Images     []string
+	Volumes    []string
+}
+
 type NukeReport struct {
 	ContainersRemoved   int
 	ImagesRemoved       int
 	VolumesRemoved      int
+	ImagesSize          int64 // sum of removed image sizes, best effort
 	BuildCacheReclaimed int64
+	BuildCachePruned    bool
 	TotalSpaceReclaimed int64
 	Duration            time.Duration
+	Detail              *NukeDetail
 }
 
 func FormatBytes(b int64) string {
